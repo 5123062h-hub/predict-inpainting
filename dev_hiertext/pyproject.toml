@@ -1,0 +1,115 @@
+[project]
+name = "predict-inpainting"
+version = "0.1.0"
+description = "HierText prediction and inpainting with text correction agent"
+readme = "README.md"
+requires-python = ">=3.11,<3.12"
+dependencies = [
+    # Core ML
+    "torch>=2.6.0,<2.7.0",
+    "torchvision>=0.21.0,<0.22.0",
+    "transformers>=4.45.0,<4.58.0",
+    "accelerate>=1.0.0,<2.0.0",
+    "safetensors>=0.4.0",
+    "tokenizers>=0.19.0,<0.23.0",
+
+    # Datasets & Evaluation
+    "datasets>=3.0.0,<3.7.0",  # modelscope constraint
+    "evaluate>=0.4.0",
+    "huggingface-hub>=0.24.0,<1.0.0",  # modelscope/diffusers constraint
+
+    # Fine-tuning
+    "peft>=0.12.0",
+    "bitsandbytes>=0.43.0",
+
+    # Image processing
+    "pillow>=10.0.0",
+    "opencv-python-headless>=4.8.0",
+
+    # Diffusion models
+    "diffusers>=0.30.0,<0.37.0",
+
+    # ModelScope (AnyText)
+    "modelscope>=1.34.0",
+
+    # LangChain (Agent)
+    "langchain>=0.3.0,<2.0.0",
+    "langchain-core>=0.3.0,<2.0.0",
+    "langchain-openai>=0.2.0,<2.0.0",
+    "langgraph>=0.2.0,<2.0.0",
+
+    # Utilities
+    "numpy>=1.24.0,<3.0.0",
+    "pandas>=2.0.0",
+    "pydantic>=2.0.0",
+    "editdistance>=0.8.0,<0.9.0",
+    "tensorboard>=2.15.0,<3.0.0",
+    "tqdm>=4.65.0",
+
+    # Packaging constraint for langchain compatibility
+    "packaging>=23.2.0,<26.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "mypy>=1.8.0",
+    "ruff>=0.3.0",
+    "pytest>=8.0.0",
+]
+flash = [
+    "flash-attn>=2.5.0",
+]
+xformers = [
+    "xformers>=0.0.25",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.uv]
+no-build-isolation-package = ["flash-attn"]
+
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cu124", marker = "sys_platform == 'linux'" },
+]
+torchvision = [
+    { index = "pytorch-cu124", marker = "sys_platform == 'linux'" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu124"
+url = "https://download.pytorch.org/whl/cu124"
+explicit = true
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+[tool.ruff.format]
+quote-style = "single"
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I"]
+ignore = []
+fixable = ["ALL"]
+
+[tool.ruff.lint.isort]
+length-sort = true
+length-sort-straight = true
+
+[tool.mypy]
+python_version = "3.11"
+follow_imports = "silent"
+plugins = ["numpy.typing.mypy_plugin"]
+disallow_any_generics = true
+strict_optional = true
+check_untyped_defs = true
+allow_redefinition = true
+
+[tool.pytest.ini_options]
+log_cli = true
+log_cli_level = "INFO"
+log_cli_format = "%(asctime)s [%(levelname)s] %(message)s (%(filename)s:%(lineno)s)"
+log_cli_date_format = "%Y-%m-%d %H:%M:%S"
