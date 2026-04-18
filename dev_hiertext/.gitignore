@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Dataset / large files
+hiertext/
+aug_samples/
+paraphrase_cache_train.json
+paraphrase_cache_train.json.done
+qwen_predictions.json
+
+# Model checkpoints
+qwen_model_*/
+models/
+models_yaml
+
+# Logs / outputs
+logs/
+logs_v2/
+logs_v3/
+out/
+output/
+training.log
+
+# IDE / misc
+.history/
+.vscode/
