@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-HierText学習済みモデルを使用したOCR推論スクリプト
+学習前のベースQwen2.5-VL-7B-Instructモデルを使用したOCR推論スクリプト
+LoRAなしの元のモデルで推論を実行
 """
 
 import os
@@ -14,8 +15,7 @@ from typing import Dict, Optional
 import torch
 import editdistance
 from PIL import Image
-from peft import PeftModel
-from transformers import AutoProcessor, BitsAndBytesConfig, AutoModelForImageTextToText
+from transformers import AutoProcessor, AutoModelForImageTextToText
 
 # =====================
 # アノテーション読み込み
@@ -192,95 +192,100 @@ def calculate_ned(reference: str, hypothesis: str) -> float:
     return distance / max_len
 
 
-def calculate_anls(reference: str, hypothesis: str, threshold: float = 0.5) -> float:
-    """
-    Average Normalized Levenshtein Similarity (ANLS) を計算
-
-    ANLS = 1 - NED if NED < threshold else 0
-    0-1の範囲、1が完璧（scene text VQA標準）
-
-    Args:
-        reference: 正解テキスト
-        hypothesis: 予測テキスト
-        threshold: NEDがこの値以上の場合スコアを0にする閾値 (デフォルト: 0.5)
-
-    Returns:
-        ANLS値 (0.0 ~ 1.0)
-    """
-    ned = calculate_ned(reference, hypothesis)
-    return 1.0 - ned if ned < threshold else 0.0
-
-
 def load_and_preprocess_image(image_path):
-    """画像をロード（リサイズはprocessorに委ねる）"""
+    """画像をロードし、アスペクト比を保持しつつ正方形にパディング"""
     try:
-        return Image.open(image_path).convert('RGB')
+        image = Image.open(image_path).convert('RGB')
+        target_size = 448
+        w, h = image.size
+
+        if w <= 0 or h <= 0:
+            print(f'Warning: Invalid image dimensions ({w}, {h}) for {image_path}')
+            raise ValueError(f'Invalid image dimensions: {w}x{h}')
+
+        # アスペクト比を保持しつつリサイズ
+        if w > h:
+            new_w = target_size
+            new_h = int(h * target_size / w)
+        else:
+            new_h = target_size
+            new_w = int(w * target_size / h)
+
+        if new_w <= 0 or new_h <= 0:
+            print(f'Warning: Calculated size would be ({new_w}, {new_h}) for {image_path}, using fallback')
+            new_w = new_h = target_size
+
+        image = image.resize((new_w, new_h), Image.Resampling.LANCZOS)
+
+        # 正方形にパディング（白背景）
+        padded_image = Image.new('RGB', (target_size, target_size), (255, 255, 255))
+        paste_x = (target_size - new_w) // 2
+        paste_y = (target_size - new_h) // 2
+        padded_image.paste(image, (paste_x, paste_y))
+
+        return padded_image
     except Exception as e:
         print(f'Error loading image {image_path}: {e}')
         raise
 
 
 def load_and_preprocess_mask_image(mask_path):
-    """マスク画像をロード（リサイズはprocessorに委ねる）"""
+    """マスク画像をロードし、前処理を適用"""
     try:
-        return Image.open(mask_path).convert('RGB')
+        mask_image = Image.open(mask_path).convert('L')
+        target_size = 448
+        w, h = mask_image.size
+
+        if w <= 0 or h <= 0:
+            print(f'Warning: Invalid mask dimensions ({w}, {h}) for {mask_path}')
+            raise ValueError(f'Invalid mask dimensions: {w}x{h}')
+
+        # アスペクト比を保持しつつリサイズ
+        if w > h:
+            new_w = target_size
+            new_h = int(h * target_size / w)
+        else:
+            new_h = target_size
+            new_w = int(w * target_size / h)
+
+        if new_w <= 0 or new_h <= 0:
+            print(f'Warning: Calculated mask size would be ({new_w}, {new_h}) for {mask_path}, using fallback')
+            new_w = new_h = target_size
+
+        mask_image = mask_image.resize((new_w, new_h), Image.Resampling.LANCZOS)
+        padded_mask = Image.new('L', (target_size, target_size), 255)
+        paste_x = (target_size - new_w) // 2
+        paste_y = (target_size - new_h) // 2
+        padded_mask.paste(mask_image, (paste_x, paste_y))
+
+        return padded_mask
     except Exception as e:
         print(f'Error loading mask {mask_path}: {e}')
         raise
 
 
-def load_model_and_processor(model_path):
-    """HierText学習済みLoRAモデルとプロセッサーを読み込み"""
+def load_base_model_and_processor():
+    """ベースQwen2.5-VL-7B-Instructモデルとプロセッサーを読み込み（LoRAなし）"""
 
-    print(f'Loading HierText LoRA model from {model_path}...')
+    print('Loading base Qwen2.5-VL-7B-Instruct model (no LoRA)...')
 
-    # LoRAアダプタのadapter_config.jsonからベースモデルIDを自動取得
-    import json as _json
-
-    adapter_config_path = os.path.join(model_path, 'lora_sft', 'adapter_config.json')
-    if not os.path.exists(adapter_config_path):
-        adapter_config_path = os.path.join(model_path, 'adapter_config.json')
-    if os.path.exists(adapter_config_path):
-        with open(adapter_config_path, 'r') as _f:
-            _cfg = _json.load(_f)
-        base_model_id = _cfg.get('base_model_name_or_path', 'Qwen/Qwen3-VL-2B-Instruct')
-        print(f'Base model from adapter_config: {base_model_id}')
-    else:
-        base_model_id = 'Qwen/Qwen2.5-VL-7B-Instruct'
+    base_model_id = 'Qwen/Qwen2.5-VL-7B-Instruct'
 
     # プロセッサーをロード
-    processor = AutoProcessor.from_pretrained(base_model_id, padding_side='left', max_pixels=448 * 448)
+    processor = AutoProcessor.from_pretrained(base_model_id, use_fast=False, padding_side='left')
     print('Processor loaded successfully')
 
-    # ベースモデルをロード（学習時と同じ4-bit量子化）
+    # ベースモデルをロード（LoRAなし）
     print('Loading base model...')
-    bnb_config = BitsAndBytesConfig(
-        load_in_4bit=True,
-        bnb_4bit_use_double_quant=True,
-        bnb_4bit_quant_type='nf4',
-        bnb_4bit_compute_dtype=torch.bfloat16,
-    )
-    base_model = AutoModelForImageTextToText.from_pretrained(
+    model = AutoModelForImageTextToText.from_pretrained(
         base_model_id,
-        quantization_config=bnb_config,
         device_map='auto',
         torch_dtype=torch.bfloat16,
         low_cpu_mem_usage=True,
     )
 
-    # LoRAアダプタをロード
-    print('Loading LoRA adapter...')
-    # lora_sftサブディレクトリが存在する場合はそちらを使用
-    adapter_path = model_path
-    lora_sft_path = os.path.join(model_path, 'lora_sft')
-    if os.path.exists(lora_sft_path) and os.path.exists(os.path.join(lora_sft_path, 'adapter_config.json')):
-        print(f'Found lora_sft subdirectory, using {lora_sft_path}')
-        adapter_path = lora_sft_path
-
-    model = PeftModel.from_pretrained(base_model, adapter_path)
     model.eval()
-    print('HierText LoRA model loaded successfully')
-    print(f'Active adapter: {model.active_adapter}')
+    print('Base Qwen model loaded successfully (no fine-tuning)')
 
     return model, processor
 
@@ -292,22 +297,22 @@ def predict_ocr(model, processor, masked_image_path, mask_image_path):
     masked_image = load_and_preprocess_image(masked_image_path)
     mask_image = load_and_preprocess_mask_image(mask_image_path)
 
-    # 学習時と同じプロンプト形式
+    # ベースモデル用プロンプト（より明示的な指示）
     prompt_text = (
         'You are given two images:\n'
         '1. A masked image where text regions are hidden\n'
         '2. A binary mask where white region is text and black region is background.\n'
-        'Task: Predict the text in the white masked region.\n'
+        'Task: Output ONLY the exact text content in the white masked region. '
+        'Do not explain, describe, or add any other information. '
+        'Just output the text itself.\n'
     )
 
-    # メッセージ構成（学習時と同じプレースホルダー形式）
+    # メッセージ構成
     content_items = [
         {'type': 'text', 'text': prompt_text},
-        {'type': 'image'},
-        {'type': 'image'},
+        {'type': 'image', 'image': masked_image},
+        {'type': 'image', 'image': mask_image},
     ]
-
-    processor_images = [masked_image, mask_image]
 
     messages = [
         {
@@ -323,6 +328,12 @@ def predict_ocr(model, processor, masked_image_path, mask_image_path):
         print(f'Chat template error: {e}')
         prompt = '<|im_start|>user\nOCR task with masked image and mask.<|im_end|>\n<|im_start|>assistant\n'
 
+    # 画像を抽出
+    processor_images = []
+    for item in content_items:
+        if item['type'] == 'image':
+            processor_images.append(item['image'])
+
     # トークン化
     inputs = processor(
         text=prompt,
@@ -330,6 +341,7 @@ def predict_ocr(model, processor, masked_image_path, mask_image_path):
         return_tensors='pt',
         padding=False,
         truncation=False,
+        do_resize=False,
     )
 
     # GPU利用可能なら移動
@@ -358,74 +370,12 @@ def predict_ocr(model, processor, masked_image_path, mask_image_path):
     return generated_text.strip()
 
 
-def save_prediction_result(
-    output_file: str, image_id: str, para_idx: int, predicted_text: str, image_path: str = None, mask_path: str = None
-):
-    """
-    推論結果をJSONファイルに保存（既存ファイルがあれば追記）
-
-    Args:
-        output_file: 保存先JSONファイルパス
-        image_id: 画像ID
-        para_idx: 段落インデックス
-        predicted_text: 推論結果テキスト
-        image_path: 元画像パス（オプション）
-        mask_path: マスク画像パス（オプション）
-    """
-    # 既存データを読み込み
-    if os.path.exists(output_file):
-        with open(output_file, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-    else:
-        data = {'predictions': {}}
-
-    # キーは "image_id_para{idx}" 形式
-    key = f'{image_id}_para{para_idx}'
-    data['predictions'][key] = {
-        'image_id': image_id,
-        'para_idx': para_idx,
-        'predicted_text': predicted_text,
-    }
-    if image_path:
-        data['predictions'][key]['image_path'] = image_path
-    if mask_path:
-        data['predictions'][key]['mask_path'] = mask_path
-
-    # 保存
-    with open(output_file, 'w', encoding='utf-8') as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-
-    print(f'Result saved to: {output_file}')
-
-
-# デフォルトの推論結果保存ファイル
-DEFAULT_PREDICTIONS_FILE = '/home/user/dev/dev_hiertext/qwen_predictions.json'
-
-
 def main():
-    parser = argparse.ArgumentParser(description='HierText学習済みモデルを使用したOCR推論')
+    parser = argparse.ArgumentParser(description='ベースQwenモデル（学習前）を使用したOCR推論')
     parser.add_argument('--image', '-i', required=True, help='マスク済み画像のパス')
     parser.add_argument('--mask', '-k', help='白黒マスク画像のパス（省略時は自動推測）')
-    parser.add_argument(
-        '--model_path',
-        '-m',
-        default='./qwen_model_checkpoints_hiertext_v4/checkpoint-16284',
-        help='学習済みモデルのパス (デフォルト: ./qwen_model_checkpoints_hiertext_v4/checkpoint-16284)',
-    )
-    parser.add_argument(
-        '--save',
-        '-s',
-        default=DEFAULT_PREDICTIONS_FILE,
-        help=f'推論結果を保存するJSONファイルパス（デフォルト: {DEFAULT_PREDICTIONS_FILE}）',
-    )
 
     args = parser.parse_args()
-
-    # モデルパスの検証
-    if not os.path.exists(args.model_path):
-        print(f'Error: Model path not found: {args.model_path}')
-        print('Please specify the correct model path with --model_path')
-        return
 
     # 入力検証
     if not os.path.exists(args.image):
@@ -447,8 +397,8 @@ def main():
         print(f'Error: Mask file not found: {mask_path}')
         return
 
-    # モデルとプロセッサーを読み込み
-    model, processor = load_model_and_processor(args.model_path)
+    # ベースモデルとプロセッサーを読み込み
+    model, processor = load_base_model_and_processor()
 
     # マスクパスからアノテーションファイルを自動推測
     ground_truth = None
@@ -479,7 +429,7 @@ def main():
         # OCR推論を実行
         result = predict_ocr(model, processor, args.image, mask_path)
         print('\n' + '=' * 50)
-        print('OCR Inference Result')
+        print('OCR Inference Result (Base Model - No Fine-tuning)')
         print('=' * 50)
         print(f'Predicted Text: {result}')
 
@@ -490,24 +440,12 @@ def main():
             # 評価指標を計算
             cer = calculate_cer(ground_truth, result)
             ned = calculate_ned(ground_truth, result)
-            anls = calculate_anls(ground_truth, result)
             print('\nMetrics:')
-            print(f'  CER:  {cer:.4f}  (低いほど良い)')
-            print(f'  NED:  {ned:.4f}  (低いほど良い)')
-            print(f'  ANLS: {anls:.4f}  (高いほど良い)')
+            print(f'  CER: {cer:.4f}')
+            print(f'  NED: {ned:.4f}')
+            print(f'  1-NED (Similarity): {1.0 - ned:.4f}')
 
         print('=' * 50 + '\n')
-
-        # 結果を保存（常にデフォルトファイルに保存）
-        if image_info:
-            save_prediction_result(
-                output_file=args.save,
-                image_id=image_info[0],
-                para_idx=image_info[1],
-                predicted_text=result,
-                image_path=args.image,
-                mask_path=mask_path,
-            )
 
     except Exception as e:
         print(f'Error during inference: {e}')

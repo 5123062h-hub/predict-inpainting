@@ -47,6 +47,7 @@ def create_mask_images():
     total_paragraphs = 0
     filtered_paragraphs = 0
     total_samples = 0
+    metadata = {}  # {"{image_id}_para{idx}": {"mask_ratio": float, "word_count": int}}
 
     for i, ann in enumerate(annotations, 1):
         image_id = ann['image_id']
@@ -145,6 +146,13 @@ def create_mask_images():
                             points = [(v[0], v[1]) for v in vertices]
                             draw_masked.polygon(points, fill=avg_color)
 
+                    # mask_ratio を計算してメタデータに記録
+                    mask_ratio = float((mask_arr > 0).sum()) / (img_width * img_height)
+                    metadata[f'{image_id}_para{para_idx}'] = {
+                        'mask_ratio': mask_ratio,
+                        'word_count': para_word_count,
+                    }
+
                     # 段落ごとにマスク画像を保存
                     mask_filename = f'mask_{image_id}_para{para_idx}.png'
                     mask_path = os.path.join(mask_dir, mask_filename)
@@ -175,8 +183,13 @@ def create_mask_images():
     print(f'Total paragraphs found: {total_paragraphs}')
     print(f'Paragraphs with ≤9 words (used for masking): {filtered_paragraphs}')
     print(f'Total samples created: {total_samples}')
+    metadata_path = os.path.join(base_dir, 'mask_metadata_train.json')
+    with open(metadata_path, 'w', encoding='utf-8') as f:
+        json.dump(metadata, f, ensure_ascii=False, indent=2)
+
     print(f'Mask images saved to: {mask_dir}')
     print(f'Masked images saved to: {masked_image_dir}')
+    print(f'Metadata saved to: {metadata_path}')
     print(f'{"=" * 60}')
 
 

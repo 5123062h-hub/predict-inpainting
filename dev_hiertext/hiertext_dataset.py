@@ -10,11 +10,15 @@ import gzip
 import json
 import random
 
+import numpy as np
 import torch
 from PIL import Image, ImageFilter
+from scipy.spatial import ConvexHull
 from tqdm import tqdm
 from torch.utils.data import Dataset
 from torchvision.transforms import ColorJitter
+
+MIN_MASK_RATIO = 0.0005  # 画像面積の0.05%未満はスキップ
 
 
 class Dataset(Dataset):
@@ -25,6 +29,7 @@ class Dataset(Dataset):
         annotation_file,
         processor,
         max_samples=None,
+        max_samples_per_image=None,
         mask_dir=None,
         masked_image_dir=None,
         augment=False,
@@ -35,9 +40,10 @@ class Dataset(Dataset):
         self.mask_dir = mask_dir
         self.masked_image_dir = masked_image_dir
         self.augment = augment
-        self.paraphrase_cache = {}  # {"{image_id}_para{idx}": ["alt1", "alt2", ...]}
         if self.augment:
             self.color_jitter = ColorJitter(brightness=0.3, contrast=0.3, saturation=0.2, hue=0.05)
+
+        self._max_samples_per_image = max_samples_per_image
 
         print(f'Loading HierText dataset from {annotation_file}...')
 
@@ -99,77 +105,58 @@ class Dataset(Dataset):
                     p['text'] for p in all_paragraphs if p['para_idx'] != para_data['para_idx'] and p['text']
                 ]
 
+                # mask_ratio を凸包面積から近似計算
+                mask_ratio = 0.0
+                all_points = np.array(
+                    [(v[0], v[1]) for verts in para_data['vertices_list'] for v in verts],
+                    dtype=np.float32,
+                )
+                if len(all_points) >= 3:
+                    try:
+                        hull = ConvexHull(all_points)
+                        mask_ratio = hull.volume / (ann.get('image_width', 1) * ann.get('image_height', 1))
+                    except Exception:
+                        pass
+
+                if mask_ratio < MIN_MASK_RATIO:
+                    continue
+
                 sample_data = {
                     'image_id': image_id,
                     'para_idx': para_data['para_idx'],
                     'text': para_data['text'],
+                    'word_count': para_data['word_count'],
+                    'mask_ratio': mask_ratio,
                     'vertices_list': para_data['vertices_list'],
-                    'surrounding_texts': surrounding_texts,  # 周辺テキストを追加
+                    'surrounding_texts': surrounding_texts,
                 }
                 self.samples.append(sample_data)
+
+        # 画像ごとにランダムで N サンプルを選択
+        if self._max_samples_per_image:
+            from collections import defaultdict
+            by_image = defaultdict(list)
+            for s in self.samples:
+                by_image[s['image_id']].append(s)
+
+            selected = []
+            for samples in by_image.values():
+                random.shuffle(samples)
+                selected.extend(samples[:self._max_samples_per_image])
+            self.samples = selected
+            print(f'Filtered to top-{self._max_samples_per_image} per image: {len(self.samples)} samples')
 
         if max_samples:
             self.samples = self.samples[:max_samples]
 
         print(f'Loaded {len(self.samples)} HierText samples (paragraphs with ≤9 words)')
 
-    def _load_and_preprocess_image(self, image_path, target_size=448):
-        """画像をロードし、アスペクト比を保持しつつ正方形にパディング"""
+    def _load_and_preprocess_image(self, image_path):
+        """画像をロード（リサイズはprocessorに委ねる）"""
         if image_path not in self._image_cache:
             image = Image.open(image_path).convert('RGB')
-            w, h = image.size
-
-            if w <= 0 or h <= 0:
-                raise ValueError(f'Invalid image dimensions: {w}x{h}')
-
-            if w > h:
-                new_w = target_size
-                new_h = int(h * target_size / w)
-            else:
-                new_h = target_size
-                new_w = int(w * target_size / h)
-
-            if new_w <= 0 or new_h <= 0:
-                new_w = new_h = target_size
-
-            image = image.resize((new_w, new_h), Image.Resampling.LANCZOS)
-
-            padded_image = Image.new('RGB', (target_size, target_size), (255, 255, 255))
-
-            paste_x = (target_size - new_w) // 2
-            paste_y = (target_size - new_h) // 2
-            padded_image.paste(image, (paste_x, paste_y))
-
-            self._image_cache[image_path] = padded_image
+            self._image_cache[image_path] = image
         return self._image_cache[image_path]
-
-    def _resize_and_pad_mask(self, mask_image):
-        """マスク画像をリサイズ&パディング（画像と同じ処理）"""
-        target_size = 448
-        w, h = mask_image.size
-
-        if w <= 0 or h <= 0:
-            raise ValueError(f'Invalid mask dimensions: {w}x{h}')
-
-        if w > h:
-            new_w = target_size
-            new_h = int(h * target_size / w)
-        else:
-            new_h = target_size
-            new_w = int(w * target_size / h)
-
-        if new_w <= 0 or new_h <= 0:
-            new_w = new_h = target_size
-
-        mask_image = mask_image.resize((new_w, new_h), Image.Resampling.BILINEAR)
-
-        padded_mask = Image.new('L', (target_size, target_size), 0)
-
-        paste_x = (target_size - new_w) // 2
-        paste_y = (target_size - new_h) // 2
-        padded_mask.paste(mask_image, (paste_x, paste_y))
-
-        return padded_mask
 
     def save_augmented_samples(self, n=10, output_dir='./aug_samples'):
         """拡張前後の比較画像を保存（3パネル: 元画像 | 拡張後masked | 拡張後mask）"""
@@ -188,7 +175,7 @@ class Dataset(Dataset):
             mask_path = os.path.join(self.mask_dir, f'mask_{image_id}_para{para_idx}.png')
 
             orig_masked = self._load_and_preprocess_image(masked_path)
-            orig_mask = self._resize_and_pad_mask(Image.open(mask_path).convert('L'))
+            orig_mask = Image.open(mask_path).convert('RGB')
 
             # 拡張を手動適用
             angle = random.uniform(-5, 5)
@@ -198,23 +185,20 @@ class Dataset(Dataset):
             if random.random() < 0.5:
                 aug_masked = aug_masked.filter(ImageFilter.GaussianBlur(radius=random.uniform(0.5, 1.5)))
 
-            # 3パネル横並び: 元masked | 拡張後masked | 拡張後mask
-            panel = Image.new('RGB', (448 * 3, 448), (200, 200, 200))
-            panel.paste(orig_masked, (0, 0))
-            panel.paste(aug_masked, (448, 0))
-            panel.paste(aug_mask.convert('RGB'), (896, 0))
+            # 可視化用に448pxにリサイズしてパネル作成
+            viz_size = 448
+            orig_masked_viz = orig_masked.resize((viz_size, viz_size), Image.Resampling.LANCZOS)
+            aug_masked_viz = aug_masked.resize((viz_size, viz_size), Image.Resampling.LANCZOS)
+            aug_mask_viz = aug_mask.resize((viz_size, viz_size), Image.Resampling.NEAREST)
+            panel = Image.new('RGB', (viz_size * 3, viz_size), (200, 200, 200))
+            panel.paste(orig_masked_viz, (0, 0))
+            panel.paste(aug_masked_viz, (viz_size, 0))
+            panel.paste(aug_mask_viz, (viz_size * 2, 0))
 
             label_safe = sample['text'][:20].replace('/', '_').replace(' ', '_')
             panel.save(os.path.join(output_dir, f'aug_sample_{i:04d}_{label_safe}.jpg'))
 
         print(f'Saved {min(n, len(self.samples))} augmented samples to {output_dir}')
-
-    def load_paraphrase_cache(self, cache_file):
-        """パラフレーズキャッシュJSONをロードして self.paraphrase_cache に注入"""
-        if cache_file and os.path.exists(cache_file):
-            with open(cache_file, 'r', encoding='utf-8') as f:
-                self.paraphrase_cache = json.load(f)
-            print(f'Loaded paraphrase cache: {len(self.paraphrase_cache)} entries from {cache_file}')
 
     def __len__(self):
         return len(self.samples)
@@ -241,8 +225,7 @@ class Dataset(Dataset):
         mask_path = os.path.join(self.mask_dir, f'mask_{image_id}_para{para_idx}.png')
         mask_image = Image.open(mask_path).convert('L')
 
-        # マスク画像もリサイズ&パディング
-        mask_image = self._resize_and_pad_mask(mask_image)
+        mask_image = mask_image.convert('RGB')
 
         # データ拡張（キャッシュ後・processor前に適用）
         if self.augment:
@@ -267,13 +250,7 @@ class Dataset(Dataset):
             {'type': 'image'},
         ]
 
-        # 教師データ: augment=True かつパラフレーズが存在する場合は確率0.5で代替テキストを使用
         target_text = sample_data['text']
-        if self.augment and self.paraphrase_cache:
-            key = f'{sample_data["image_id"]}_para{sample_data["para_idx"]}'
-            alternatives = self.paraphrase_cache.get(key, [])
-            if alternatives and random.random() < 0.5:
-                target_text = random.choice(alternatives)
 
         # messagesにassistant roleを含めて、processorに完全なフォーマットを任せる
         messages = [
@@ -291,10 +268,7 @@ class Dataset(Dataset):
             text=prompt,
             images=processor_images,
             return_tensors='pt',
-            padding='max_length',
-            max_length=768,
-            truncation=False,
-            do_resize=False,
+            padding=False,
         )
 
         # labelsの作成: assistant応答部分のみを学習対象とする

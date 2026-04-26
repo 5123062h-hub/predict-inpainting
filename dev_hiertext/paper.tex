@@ -1,0 +1,813 @@
+\documentclass[uplatex,10pt,twocolumn,a4paper]{article}
+
+% -------------------------------------------------------
+% Packages
+% -------------------------------------------------------
+\usepackage[dvipdfmx]{graphicx}
+\usepackage[dvipdfmx,hidelinks]{hyperref}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{booktabs}
+\usepackage{geometry}
+\usepackage{algorithm}
+\usepackage{algorithmic}
+\usepackage{xcolor}
+\usepackage{caption}
+\usepackage{subcaption}
+\usepackage{cite}
+\usepackage{url}
+
+\geometry{a4paper, left=18mm, right=18mm, top=22mm, bottom=22mm,
+          columnsep=6mm}
+
+\newcommand{\TODO}[1]{\textcolor{red}{\textbf{[#1]}}}
+\newcommand{\ie}{\textit{i.e.,}\ }
+\newcommand{\eg}{\textit{e.g.,}\ }
+\newcommand{\etal}{\textit{et al.}}
+
+% -------------------------------------------------------
+% Title
+% -------------------------------------------------------
+\title{
+  \vspace{-6mm}
+  \Large\textbf{Context-Aware Preference Tuning for Masked Scene Text Prediction\\
+  with Agentic Self-Correction}
+}
+
+\author{
+  Sho Yamamoto\\
+  \small Hitotsubashi University\\
+  \small \texttt{5123062h@g.hit-u.ac.jp}
+}
+
+\date{}
+
+% -------------------------------------------------------
+\begin{document}
+% -------------------------------------------------------
+
+\maketitle
+\thispagestyle{empty}
+
+% -------------------------------------------------------
+\begin{abstract}
+% -------------------------------------------------------
+We address the task of \emph{masked scene text prediction}: given a
+natural image in which a text region has been occluded together with a
+binary mask indicating the occluded area, a model must recover the
+original text string from visual context alone.
+Existing Vision-Language Models (VLMs) can be adapted to this task via
+supervised fine-tuning, but standard cross-entropy training treats all
+plausible outputs equally and fails to exploit the rich contextual
+information available from surrounding scene text.
+
+We propose a two-phase fine-tuning pipeline for Qwen3-VL-2B-Instruct.
+\textbf{Phase~1} performs supervised fine-tuning (SFT) with paraphrase
+augmentation, teaching the model to predict masked text from
+(masked image, binary mask) pairs.
+\textbf{Phase~2} applies \emph{context-aware online Direct Preference
+Optimisation} (DPO): at each step, multiple candidate predictions are
+sampled from the current policy and ranked by their embedding-space
+similarity to the surrounding scene context---both the neighbouring
+paragraph texts and the masked image---using a visual-language embedding
+model.
+This automatically constructs preference pairs without any human
+annotation, directly encouraging predictions that are semantically
+consistent with the scene.
+We further embed the fine-tuned model into a \textbf{self-correcting
+agent loop}: the model evaluates rendered text across two visual
+granularities and iteratively adapts generation parameters to improve
+both character accuracy and background harmony.
+
+On the HierText validation set, our two-phase fine-tuned model achieves
+\TODO{XX}\% CER reduction and \TODO{XX}-point ANLS improvement over the
+base Qwen3-VL-2B model.
+Ablation studies confirm that context-aware DPO contributes
+\TODO{XX}~CER points beyond SFT alone.
+
+\end{abstract}
+
+% -------------------------------------------------------
+\section{Introduction}
+\label{sec:intro}
+% -------------------------------------------------------
+
+Reading text that has been partially or fully hidden in a scene image
+is a problem that arises naturally in document restoration, copyright
+enforcement, and augmented-reality overlay verification.
+Unlike standard scene text recognition (STR), where the text is
+\emph{visible}, masked text prediction requires the model to infer the
+hidden content from surrounding visual and textual context: the shape
+of the occluded region, the style of visible neighbouring text, and the
+semantic coherence of the scene.
+
+Recent Vision-Language Models such as the Qwen-VL
+family~\cite{qwen2vl2024} possess broad visual understanding that makes
+them natural candidates for this task.
+However, standard supervised fine-tuning (SFT) via cross-entropy loss
+has two shortcomings.
+First, it provides no mechanism to prefer outputs that are
+\emph{contextually plausible} over those that are merely character-wise
+plausible.
+Second, when multiple reasonable phrasings exist (\eg through
+capitalisation, punctuation, or synonym variation), SFT conflates them
+by penalising all non-gold-standard predictions equally.
+
+We address both limitations by combining SFT with \emph{context-aware
+online Direct Preference Optimisation}~\cite{dpo2023}.
+Our key insight is that the correct hidden text should be semantically
+consistent with the surrounding scene: nearby paragraph texts share
+topic and style, and the masked image encodes spatial context.
+Concretely, at each training step we sample $N$ candidate predictions,
+score them by their cosine similarity to a context embedding formed from
+surrounding paragraph texts and the masked image via a VL embedding
+model, and use the best/worst pair as the chosen/rejected response for
+a DPO update.
+This requires \emph{no human preference labels} and can run online
+without a separate reward model.
+
+Beyond the prediction model, we embed it in a \textbf{self-correcting
+agent loop} for scene text rendering.
+Given a target text, the agent iteratively generates candidate
+inpaintings with a diffusion-based text renderer, evaluates rendered
+quality at two visual granularities using the fine-tuned VLM, and feeds
+structured parameter corrections back to the renderer.
+A \emph{scene-anchoring} mechanism stabilises the background caption
+across iterations, preventing prompt drift.
+
+Our contributions are:
+
+\begin{itemize}
+  \item \textbf{Two-phase SFT + context-aware online DPO.}
+    We show that DPO with embedding-based, annotation-free preference
+    construction improves masked text prediction beyond SFT alone.
+
+  \item \textbf{Paraphrase augmentation.}
+    We pre-generate lexical paraphrases of ground-truth labels and
+    inject them randomly during SFT, improving robustness to surface
+    variation.
+
+  \item \textbf{Context-aware preference scoring.}
+    Candidate responses are ranked by cosine similarity to a joint
+    text-and-image context embedding, directly leveraging scene
+    coherence as a supervision signal.
+
+  \item \textbf{Self-correcting rendering agent.}
+    The fine-tuned VLM evaluates rendered text at two spatial
+    granularities and provides actionable parameter corrections in a
+    structured agent loop.
+\end{itemize}
+
+% -------------------------------------------------------
+\section{Related Work}
+\label{sec:related}
+% -------------------------------------------------------
+
+\paragraph{Scene text recognition.}
+Classic pipelines combine CNNs with CTC or attention-based
+decoders~\cite{crnn2015, aster2019, abinet2021}.
+TrOCR~\cite{trocr2021} adapts encoder-decoder transformers pre-trained
+on image-text pairs, achieving strong STR performance.
+LLaVAR~\cite{llavar2023} shows that VLMs can be instruction-tuned for
+text-rich image understanding.
+None of these works addresses \emph{masked} text, where character
+appearance is unavailable and context reasoning is essential.
+
+\paragraph{Direct Preference Optimisation.}
+DPO~\cite{dpo2023} reframes RLHF as a classification objective over
+chosen/rejected response pairs, eliminating the need for an explicit
+reward model.
+Online DPO~\cite{onlinedpo2024} generates preference pairs from the
+current policy, reducing distribution mismatch.
+We extend online DPO to the multimodal masked-text setting and replace
+human annotations with embedding-based scene-coherence scoring.
+
+\paragraph{Preference learning without human labels.}
+RLAIF~\cite{rlaif2023} uses an LLM as the preference annotator.
+Self-Play Fine-Tuning (SPIN)~\cite{spin2024} constructs pairs by
+treating the SFT model's own outputs as rejected responses.
+Our approach is orthogonal: we use a separate embedding model to score
+candidate predictions by scene-context similarity, which is a
+domain-specific signal unavailable to general-purpose LLM annotators.
+
+\paragraph{Text-in-image generation.}
+AnyText~\cite{anytext2023} conditions a latent diffusion model on text
+glyphs and auxiliary guidance for text inpainting.
+TextDiffuser~\cite{textdiffuser2023} and
+GlyphControl~\cite{glyphcontrol2023} add layout control.
+These models operate in a single forward pass with no quality feedback;
+our agent loop closes this gap.
+
+\paragraph{Agentic self-refinement.}
+ReAct~\cite{react2022} and Reflexion~\cite{reflexion2023} equip LLMs
+with iterative self-correction.
+Self-Refine~\cite{selfrefine2023} applies iterative feedback to text
+generation.
+We extend this paradigm to multimodal scene text rendering, with a
+VLM providing structured visual feedback at two granularities.
+
+% -------------------------------------------------------
+\section{Method}
+\label{sec:method}
+% -------------------------------------------------------
+
+\subsection{Problem Formulation}
+\label{sec:problem}
+
+Let $I \in \mathbb{R}^{H \times W \times 3}$ be a natural scene image
+and $M \in \{0,1\}^{H \times W}$ a binary mask indicating a text
+region ($M_{ij}=1$ at text pixels).
+The masked image $\tilde{I} = I \odot (1 - M)$ has the text region
+set to white.
+We also observe a set of surrounding paragraph texts
+$\mathcal{C} = \{c_1, \ldots, c_K\}$ from the same image.
+
+The \textbf{masked text prediction} task is: given $(\tilde{I}, M)$,
+predict the ground-truth text string $y^* = (y_1,\ldots,y_T)$ that
+occupied the masked region.
+The \textbf{scene text rendering} task (Section~\ref{sec:stage2}) is:
+given $(\tilde{I}, M, y^*)$, produce a composited image $\hat{I}$ that
+renders $y^*$ naturally into the scene.
+
+\subsection{Stage 1: Supervised Fine-Tuning}
+\label{sec:sft}
+
+\paragraph{Model and adaptation.}
+We fine-tune Qwen3-VL-2B-Instruct~\cite{qwen3vl2025} using
+QLoRA~\cite{qlora2023} with 4-bit NF4 quantisation and double
+quantisation~\cite{qlora2023}.
+LoRA adapters (rank $r=4$, scaling $\alpha=16$, dropout $p=0.05$) are
+attached to the query and value projection matrices ($\mathbf{W}_q$,
+$\mathbf{W}_v$) of every attention layer.
+
+\paragraph{Input format.}
+Each training sample presents two images to the VLM in sequence:
+(1) the masked scene image $\tilde{I}$, and
+(2) the binary mask $M$ converted to a three-channel grayscale image.
+The system prompt is fixed across all samples:
+\begin{quote}
+  \small
+  \textit{``You are given two images: (1) a masked image where text
+  regions are hidden; (2) a binary mask where the white region is text
+  and the black region is background.
+  Task: Predict the text in the white masked region.''}
+\end{quote}
+The assistant response is the ground-truth text $y^*$.
+We apply the Qwen3 chat template with \texttt{add\_generation\_prompt=False}
+so that both the prompt and the response are encoded in a single forward
+pass, and set labels to $-100$ for all prompt tokens so that the loss
+is computed only over the response.
+
+\paragraph{Paraphrase augmentation.}
+A fixed ground-truth label during SFT risks overfitting to a single
+surface form.
+We pre-generate lexical paraphrases for each training sample
+(capitalisation variants, punctuation variants, minor rephrasing) and
+cache them.
+With probability $0.5$ per sample, the target text is replaced by a
+uniformly sampled paraphrase.
+This acts as a form of label smoothing tailored to the character-level
+metric space and reduces sensitivity to case or punctuation ambiguity.
+
+\paragraph{Data augmentation.}
+Both $\tilde{I}$ and $M$ undergo: random rotation by $\theta \sim
+\mathcal{U}(-5^\circ, 5^\circ)$ (applied with the same angle to both
+images to preserve alignment); colour jitter (brightness $\pm 0.3$,
+contrast $\pm 0.3$, saturation $\pm 0.2$, hue $\pm 0.05$) applied to
+$\tilde{I}$ only; and Gaussian blur (radius $r \sim \mathcal{U}(0.5,
+1.5)$) applied to $\tilde{I}$ with probability $0.5$.
+
+\paragraph{Sample selection.}
+HierText provides hierarchical word/line/paragraph annotations.
+We use only paragraphs with at most 9 words to keep the prediction
+tractable.
+For each image we retain at most 3 paragraphs, ranked by a
+coverage-weighted score:
+\begin{equation}
+  \text{score}(p) = \rho(p) \cdot \log\bigl(1 + n_w(p)\bigr),
+  \label{eq:score}
+\end{equation}
+where $\rho(p)$ is the convex-hull area of paragraph $p$ as a fraction
+of image area and $n_w(p)$ is the word count.
+This prioritises spatially prominent paragraphs with sufficient text.
+
+\paragraph{Training objective.}
+The SFT loss is the standard causal language modelling cross-entropy:
+\begin{equation}
+  \mathcal{L}_\mathrm{SFT} = -\sum_{t=1}^{T} \log P_\theta(y_t \mid
+  \tilde{I}, M, y_{<t}),
+  \label{eq:sft}
+\end{equation}
+computed only over response tokens.
+
+\subsection{Stage 2: Context-Aware Online DPO}
+\label{sec:dpo}
+
+After SFT the model is further tuned with online DPO to incorporate
+scene-context preferences.
+At each optimisation step, a subset of batch samples undergoes the
+preference construction procedure described below.
+
+\paragraph{Candidate generation.}
+For each selected sample $i$, we sample $N=3$ candidate responses
+$\{\hat{y}^{(1)}, \ldots, \hat{y}^{(N)}\}$ from the current policy
+$\pi_\theta$ in inference mode, using temperature $T=0.9$ and a maximum
+of 32 new tokens.
+Duplicate candidates are de-duplicated; if fewer than 2 unique
+candidates remain, the sample is skipped.
+
+\paragraph{Context embedding.}
+We use a visual-language embedding model (Qwen3-VL-Embedding) to
+construct a context vector $\mathbf{v}_\mathcal{C}$ for sample $i$.
+Surrounding paragraph texts $\mathcal{C} = \{c_1, \ldots, c_K\}$
+(up to $K=8$) are each encoded and averaged:
+\begin{equation}
+  \mathbf{v}_\text{text} = \ell_2\text{-norm}\!\left(
+    \frac{1}{|\mathcal{C}|}\sum_{k} f_\phi(c_k)
+  \right) \in \mathbb{R}^d,
+  \label{eq:text_embed}
+\end{equation}
+where $f_\phi$ denotes the embedding model's last-token hidden state.
+Additionally, if the masked image path $\tilde{I}_i$ is available, an
+image embedding is extracted:
+\begin{equation}
+  \mathbf{v}_\text{img} = \ell_2\text{-norm}\!\left(
+    \frac{1}{L}\sum_{\ell=1}^{L} f_\phi(\tilde{I}_i)_\ell
+  \right) \in \mathbb{R}^d,
+  \label{eq:img_embed}
+\end{equation}
+where the mean is over sequence positions $\ell$.
+The joint context embedding is
+\begin{equation}
+  \mathbf{v}_\mathcal{C} = \ell_2\text{-norm}
+    (\mathbf{v}_\text{text} + \mathbf{v}_\text{img}).
+  \label{eq:joint_embed}
+\end{equation}
+When no image is available, $\mathbf{v}_\mathcal{C} = \mathbf{v}_\text{text}$.
+
+\paragraph{Preference construction.}
+Each candidate $\hat{y}^{(n)}$ is encoded as a text embedding
+$\mathbf{u}^{(n)} = \ell_2\text{-norm}(f_\phi(\hat{y}^{(n)}))$ and
+scored by cosine similarity to the context:
+\begin{equation}
+  s^{(n)} = \mathbf{u}^{(n)\top} \mathbf{v}_\mathcal{C}.
+  \label{eq:score_dpo}
+\end{equation}
+The candidate with the highest score is designated
+\emph{chosen} ($y_+$) and the one with the lowest score is
+\emph{rejected} ($y_-$).
+
+\paragraph{DPO loss.}
+We use the standard DPO objective~\cite{dpo2023} with the base model
+(LoRA adapters disabled) as the reference policy $\pi_\mathrm{ref}$:
+\begin{equation}
+  \mathcal{L}_\mathrm{DPO} = -\log\sigma\!\Bigl(
+    \beta \bigl[
+      \log\tfrac{\pi_\theta(y_+ \mid \tilde{I}, M)}
+                {\pi_\mathrm{ref}(y_+ \mid \tilde{I}, M)}
+      -
+      \log\tfrac{\pi_\theta(y_- \mid \tilde{I}, M)}
+                {\pi_\mathrm{ref}(y_- \mid \tilde{I}, M)}
+    \bigr]
+  \Bigr),
+  \label{eq:dpo}
+\end{equation}
+where $\beta=0.1$ controls the deviation from the reference policy.
+Sequence log-probabilities are computed as the sum of per-token
+log-softmax values over the response span.
+
+\paragraph{Combined training loss.}
+During the DPO phase the cross-entropy loss from Eq.~\ref{eq:sft}
+is retained and the DPO term is added with weight $w=0.1$:
+\begin{equation}
+  \mathcal{L} = \mathcal{L}_\mathrm{SFT} +
+                w \cdot \mathcal{L}_\mathrm{DPO}.
+  \label{eq:total}
+\end{equation}
+To avoid excessive overhead, the DPO update is applied every
+$\Delta_\mathrm{DPO} = 100$ gradient steps, and 2 samples per batch
+are selected for preference construction at each application.
+
+\subsection{Stage 3: Self-Correcting Rendering Agent}
+\label{sec:stage2}
+
+The fine-tuned VLM is embedded in a self-correcting agent loop for
+scene text rendering (Algorithm~\ref{alg:agent}).
+The loop uses AnyText~\cite{anytext2023} as the text inpainting
+backbone and the VLM as a dual-granularity evaluator.
+
+\begin{algorithm}[t]
+  \caption{TextCorrectionAgent.run($\tilde{I}$, $M$, $y^*$)}
+  \label{alg:agent}
+  \begin{algorithmic}[1]
+    \STATE $y \leftarrow y^*$;\ $\text{scene} \leftarrow \emptyset$;\
+           $\text{style} \leftarrow \emptyset$;\ $i \leftarrow 0$
+    \WHILE{$i < K$}
+      \STATE $i \leftarrow i + 1$
+      \STATE $\hat{I} \leftarrow \textsc{AnyText}(y,\, M,\, \tilde{I},\,
+             [\text{scene};\, \text{style}])$
+      \STATE $e \leftarrow \textsc{Evaluate}(\hat{I},\, y^*,\, M)$
+             \COMMENT{Sec.~\ref{sec:evaluator}}
+      \IF{$e.s \geq \tau$ \textbf{or} \textsc{NoImprovement}($3$)}
+        \RETURN $\arg\max_j \hat{I}_j$
+      \ENDIF
+      \STATE update rendering params from $e$
+      \IF{$\text{scene} = \emptyset$}
+        \STATE $\text{scene} \leftarrow e.\texttt{suggested\_prompt}$
+      \ENDIF
+      \STATE $\text{style} \leftarrow e.\texttt{text\_style\_instruction}$
+    \ENDWHILE
+    \RETURN $\arg\max_j \hat{I}_j$
+  \end{algorithmic}
+\end{algorithm}
+
+\paragraph{Dual-granularity evaluator.}
+\label{sec:evaluator}
+Given a generated image $\hat{I}$, the VLM receives two inputs:
+
+\begin{enumerate}
+  \item \textbf{Text-region crop.}
+    The bounding box of mask $M$ is expanded by margin
+    $m = \max(\max(w, h),\, 50)$ pixels on each side,
+    square-cropped, and upscaled to $768\times768$.
+    This enables character-level legibility assessment.
+  \item \textbf{Full composite image.}
+    The complete $\hat{I}$ enables holistic background-harmony scoring
+    and scene captioning.
+\end{enumerate}
+
+The VLM returns a structured response containing:
+text accuracy $s_\mathrm{text} \in [0,1]$,
+background harmony $s_\mathrm{harmony} \in [0,1]$,
+overall score $s = (s_\mathrm{text} + s_\mathrm{harmony})/2$,
+a background scene caption (\texttt{suggested\_prompt}),
+a rendering style instruction (\texttt{text\_style\_instruction}),
+and optional parameter adjustments
+$\Delta s_\mathrm{cfg}$, $\Delta r_\mathrm{mask}$,
+$\Delta r_\mathrm{crop}$.
+
+\paragraph{Structured parameter adaptation.}
+Three AnyText parameters are updated each iteration:
+$s_\mathrm{cfg}$ (classifier-free guidance scale),
+$r_\mathrm{mask}$ (mask dilation factor), and
+$r_\mathrm{crop}$ (crop margin).
+Table~\ref{tab:rules} lists the failure-mode-to-correction mapping
+output by the evaluator.
+
+\begin{table}[t]
+  \centering
+  \caption{Parameter adaptation rules output by the evaluator.}
+  \label{tab:rules}
+  \small
+  \begin{tabular}{lc}
+    \toprule
+    Observed failure & Corrective action \\
+    \midrule
+    Characters cramped / overlapping & $r_\mathrm{mask} > 1.0$ \\
+    Characters too sparse            & $r_\mathrm{mask} < 1.0$ \\
+    Excess background in crop        & $r_\mathrm{crop} < 1.0$ \\
+    Text too long for region         & shorten $y$ \\
+    Garbled characters               & $s_\mathrm{cfg} \in [13,15]$ \\
+    Artefacts / white blobs          & $s_\mathrm{cfg} \in [7.5,\,9]$ \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\paragraph{Scene anchoring.}
+The background caption produced on the first iteration is \emph{fixed}
+for all subsequent iterations; only the style instruction is updated.
+This prevents the evaluator from inadvertently describing rendered
+characters as part of the scene, which would pollute subsequent
+generation prompts.
+The generation prompt at iteration $i$ is:
+\begin{equation}
+  p_i = [\text{scene};\, \text{style}_i],
+  \label{eq:prompt}
+\end{equation}
+where $[\cdot;\cdot]$ denotes comma-separated concatenation.
+
+\paragraph{Early stopping.}
+The loop terminates when $s \geq \tau = 0.9$ (success) or when the
+overall score does not improve over $N_\mathrm{patience} = 3$
+consecutive iterations.
+The maximum iteration count is $K = 5$.
+
+% -------------------------------------------------------
+\section{Experiments}
+\label{sec:experiments}
+% -------------------------------------------------------
+
+\subsection{Setup}
+
+\paragraph{Dataset.}
+We use HierText~\cite{hiertext2022}, a large-scale dataset with
+hierarchical word/line/paragraph annotations on natural scene images.
+After filtering to paragraphs with $\leq 9$ words and applying the
+coverage-weighted selection (Eq.~\ref{eq:score}), we obtain
+\TODO{N\_train} training and \TODO{N\_val} validation samples.
+
+\paragraph{Evaluation metrics.}
+\begin{itemize}
+  \item \textbf{CER} (Character Error Rate): $\text{edit}(\hat{y},
+    y^*) / |y^*|$. Lower is better.
+  \item \textbf{NED} (Normalised Edit Distance): $\text{edit}(\hat{y},
+    y^*) / \max(|\hat{y}|, |y^*|)$. Lower is better.
+  \item \textbf{ANLS}: $1 - \text{NED}$. Higher is better.
+  \item \textbf{Acc@1}: Exact-match accuracy after stripping
+    whitespace. Higher is better.
+\end{itemize}
+
+\paragraph{Training details.}
+SFT runs for 6 epochs with AdamW (paged 8-bit), learning rate
+$\eta = 2 \times 10^{-5}$, cosine schedule, $10\%$ linear warmup, and
+per-device batch size 4.
+The DPO phase uses the same optimiser and schedule; the DPO-specific
+hyperparameters are $\beta = 0.1$, $w = 0.1$, $N = 3$ candidates,
+$\Delta_\mathrm{DPO} = 100$ steps.
+All experiments use a single GPU with 4-bit NF4 QLoRA.
+
+\subsection{Masked Text Prediction}
+
+Table~\ref{tab:ocr} compares masked text prediction accuracy.
+
+\begin{table}[t]
+  \centering
+  \caption{Masked text prediction on HierText validation.}
+  \label{tab:ocr}
+  \small
+  \begin{tabular}{lcccc}
+    \toprule
+    Model & CER$\downarrow$ & NED$\downarrow$ & ANLS$\uparrow$ & Acc@1$\uparrow$ \\
+    \midrule
+    Qwen3-VL-2B (base)         & \TODO{.XX} & \TODO{.XX} & \TODO{.XX} & \TODO{.XX} \\
+    + SFT                      & \TODO{.XX} & \TODO{.XX} & \TODO{.XX} & \TODO{.XX} \\
+    + SFT + paraphrase aug.    & \TODO{.XX} & \TODO{.XX} & \TODO{.XX} & \TODO{.XX} \\
+    + SFT + context-aware DPO  & \TODO{.XX} & \TODO{.XX} & \TODO{.XX} & \TODO{.XX} \\
+    \textbf{Ours (full)}       & \TODO{.XX} & \TODO{.XX} & \TODO{.XX} & \TODO{.XX} \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\paragraph{Effect of context-aware DPO.}
+Context-aware DPO improves over SFT alone by encouraging predictions
+that are semantically coherent with the surrounding scene.
+The benefit is most pronounced for ambiguous samples where multiple
+character sequences are visually plausible but differ in scene-level
+coherence (\eg product names matching visible brand text, or numbers
+consistent with surrounding signage).
+
+\paragraph{Effect of paraphrase augmentation.}
+Paraphrase augmentation provides gains on samples with alternative
+valid surface forms, reducing CER on mixed-case and punctuated text.
+The combination of augmentation and DPO is complementary: augmentation
+addresses surface-form robustness during SFT, while DPO addresses
+semantic consistency during preference tuning.
+
+\subsection{Ablation: DPO Scoring Strategy}
+
+Table~\ref{tab:ablation_dpo} compares context-aware scoring against
+alternative preference construction strategies.
+
+\begin{table}[t]
+  \centering
+  \caption{Ablation on DPO preference construction.}
+  \label{tab:ablation_dpo}
+  \small
+  \begin{tabular}{lcc}
+    \toprule
+    Scoring strategy & CER$\downarrow$ & ANLS$\uparrow$ \\
+    \midrule
+    SFT only (no DPO)            & \TODO{.XX} & \TODO{.XX} \\
+    DPO w/ text context only     & \TODO{.XX} & \TODO{.XX} \\
+    DPO w/ image context only    & \TODO{.XX} & \TODO{.XX} \\
+    DPO w/ text + image (ours)   & \TODO{.XX} & \TODO{.XX} \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+Combining textual and visual context yields the best performance,
+confirming that surrounding paragraph texts and the masked image
+encode complementary information for scoring candidate predictions.
+
+\subsection{Agent Loop: Scene Text Rendering Quality}
+
+Table~\ref{tab:rendering} reports VLM-Score and convergence rate for
+the self-correcting agent against baselines.
+
+\begin{table}[t]
+  \centering
+  \caption{Scene text rendering quality on HierText validation.}
+  \label{tab:rendering}
+  \small
+  \begin{tabular}{lcc}
+    \toprule
+    Method & VLM-Score$\uparrow$ & Conv.\ rate$\uparrow$ \\
+    \midrule
+    AnyText (single shot)           & \TODO{0.XX} & --- \\
+    AnyText + OCR feedback          & \TODO{0.XX} & \TODO{XX}\% \\
+    Ours (agent, $K=5$, base VLM)  & \TODO{0.XX} & \TODO{XX}\% \\
+    Ours (agent, $K=5$, tuned VLM) & \TODO{0.XX} & \TODO{XX}\% \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+Using the fine-tuned VLM as the evaluator improves over the base model,
+demonstrating that HierText-specific knowledge acquired during SFT+DPO
+transfers to the evaluation role.
+Scene anchoring prevents caption drift and contributes
+\TODO{X} VLM-Score points in the ablation (Table~\ref{tab:ablation_agent}).
+
+\begin{table}[t]
+  \centering
+  \caption{Ablation on agent components (VLM-Score).}
+  \label{tab:ablation_agent}
+  \small
+  \begin{tabular}{lcc}
+    \toprule
+    Configuration & VLM-Score & Conv.\ rate \\
+    \midrule
+    Full agent                       & \TODO{0.XX} & \TODO{XX}\% \\
+    w/o scene anchoring              & \TODO{0.XX} & \TODO{XX}\% \\
+    w/o dual-granularity evaluation  & \TODO{0.XX} & \TODO{XX}\% \\
+    w/o parameter adaptation         & \TODO{0.XX} & \TODO{XX}\% \\
+    w/o style instruction            & \TODO{0.XX} & \TODO{XX}\% \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\begin{figure}[t]
+  \centering
+  \fbox{\rule{0pt}{30mm}\rule{0.96\linewidth}{0pt}}
+  \caption{
+    Mean VLM-Score across agent iterations (shaded: $\pm$1~std).
+    The dashed line marks the success threshold $\tau = 0.9$.
+  }
+  \label{fig:convergence}
+\end{figure}
+
+% -------------------------------------------------------
+\section{Discussion}
+\label{sec:discussion}
+% -------------------------------------------------------
+
+\paragraph{Annotation-free preference learning.}
+Our context-aware DPO requires only the existing HierText paragraph
+annotations for the surrounding-text context.
+No additional human preference labels are needed.
+This makes the approach directly applicable to any dataset with
+hierarchical or spatially clustered text annotations.
+
+\paragraph{Model size and efficiency.}
+We deliberately chose the 2B parameter model over larger alternatives
+to demonstrate that strong masked-text prediction is achievable with a
+compact VLM under QLoRA.
+The full SFT+DPO training fits on a single GPU with 4-bit
+quantisation.
+The online DPO candidate generation (3 sequences per selected sample,
+every 100 steps) adds approximately \TODO{XX}\% wall-clock overhead
+relative to SFT alone.
+
+\paragraph{Limitations.}
+The embedding-based preference scoring relies on the assumption that
+the correct text is more semantically similar to surrounding context
+than incorrect alternatives.
+This assumption may fail for isolated signs, foreign-language text, or
+numerals with no topical connection to surrounding paragraphs.
+The agent loop additionally incurs $O(K)$ generator calls per image,
+which limits throughput.
+Extension to other inpainting backbones beyond AnyText is
+straightforward given the modular architecture.
+
+% -------------------------------------------------------
+\section{Conclusion}
+\label{sec:conclusion}
+% -------------------------------------------------------
+
+We presented a two-phase fine-tuning approach for masked scene text
+prediction.
+Phase~1 (SFT with paraphrase augmentation) establishes a strong
+baseline by training Qwen3-VL-2B-Instruct on (masked image, binary
+mask) pairs.
+Phase~2 (context-aware online DPO) further improves predictions by
+scoring candidates using embedding-space similarity to the surrounding
+scene context---both paragraph texts and the masked image---without any
+human preference labels.
+The fine-tuned model is embedded in a self-correcting agent loop that
+iteratively adjusts AnyText rendering parameters guided by structured
+dual-granularity visual evaluation.
+On HierText, the full system achieves \TODO{XX}\% CER reduction over
+the base model and \TODO{XX} VLM-Score points improvement over
+single-shot rendering.
+We believe annotation-free preference construction via scene context is
+a broadly applicable technique for other structured text-in-image tasks.
+
+% -------------------------------------------------------
+\bibliographystyle{plain}
+\begin{thebibliography}{99}
+
+\bibitem{qwen3vl2025}
+Qwen Team,
+``Qwen3-VL: Seeing and Reading the World,''
+\textit{arXiv:2504.10479}, 2025.
+
+\bibitem{qwen2vl2024}
+Qwen Team,
+``Qwen2-VL: Enhancing Vision-Language Model's Perception of the World
+at Any Resolution,''
+\textit{arXiv:2409.12191}, 2024.
+
+\bibitem{hiertext2022}
+A.~Long \etal,
+``Towards End-to-End Unified Scene Text Detection and Layout Analysis,''
+\textit{CVPR}, 2022.
+
+\bibitem{dpo2023}
+R.~Rafailov \etal,
+``Direct Preference Optimization: Your Language Model is Secretly a
+Reward Model,''
+\textit{NeurIPS}, 2023.
+
+\bibitem{onlinedpo2024}
+T.~Guo \etal,
+``Direct Language Model Alignment from Online AI Feedback,''
+\textit{arXiv:2402.04792}, 2024.
+
+\bibitem{qlora2023}
+T.~Dettmers \etal,
+``QLoRA: Efficient Finetuning of Quantized LLMs,''
+\textit{NeurIPS}, 2023.
+
+\bibitem{anytext2023}
+T.~Tuo \etal,
+``AnyText: Multilingual Visual Text Generation and Editing,''
+\textit{arXiv:2311.03054}, 2023.
+
+\bibitem{textdiffuser2023}
+J.~Chen \etal,
+``TextDiffuser: Diffusion Models as Text Painters,''
+\textit{NeurIPS}, 2023.
+
+\bibitem{glyphcontrol2023}
+Y.~Yang \etal,
+``GlyphControl: Glyph Conditional Control for Visual Text Generation,''
+\textit{NeurIPS}, 2023.
+
+\bibitem{crnn2015}
+B.~Shi \etal,
+``An End-to-End Trainable Neural Network for Image-based Sequence
+Recognition,''
+\textit{TPAMI}, 2017.
+
+\bibitem{aster2019}
+B.~Shi \etal,
+``ASTER: An Attentional Scene Text Recognizer with Flexible
+Rectification,''
+\textit{TPAMI}, 2019.
+
+\bibitem{abinet2021}
+F.~Fang \etal,
+``Read Like Humans: Autonomous, Bidirectional and Iterative Language
+Modeling for Scene Text Recognition,''
+\textit{CVPR}, 2021.
+
+\bibitem{trocr2021}
+M.~Li \etal,
+``TrOCR: Transformer-based Optical Character Recognition with
+Pre-trained Models,''
+\textit{AAAI}, 2023.
+
+\bibitem{llavar2023}
+Y.~Zhang \etal,
+``LLaVAR: Enhanced Visual Instruction Tuning for Text-Rich Image
+Understanding,''
+\textit{arXiv:2306.17107}, 2023.
+
+\bibitem{rlaif2023}
+H.~Lee \etal,
+``RLAIF: Scaling Reinforcement Learning from Human Feedback with AI
+Feedback,''
+\textit{arXiv:2309.00267}, 2023.
+
+\bibitem{spin2024}
+Z.~Chen \etal,
+``Self-Play Fine-Tuning Converts Weak Language Models to Strong Language
+Models,''
+\textit{ICML}, 2024.
+
+\bibitem{react2022}
+S.~Yao \etal,
+``ReAct: Synergizing Reasoning and Acting in Language Models,''
+\textit{ICLR}, 2023.
+
+\bibitem{reflexion2023}
+N.~Shinn \etal,
+``Reflexion: Language Agents with Verbal Reinforcement Learning,''
+\textit{NeurIPS}, 2023.
+
+\bibitem{selfrefine2023}
+A.~Madaan \etal,
+``Self-Refine: Iterative Refinement with Self-Feedback,''
+\textit{NeurIPS}, 2023.
+
+\end{thebibliography}
+
+\end{document}

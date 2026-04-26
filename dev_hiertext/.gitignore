@@ -5,6 +5,7 @@ __pycache__/
 
 # Dataset / large files
 hiertext/
+textocr/
 aug_samples/
 paraphrase_cache_train.json
 paraphrase_cache_train.json.done
@@ -19,6 +20,8 @@ models_yaml
 logs/
 logs_v2/
 logs_v3/
+logs_v4/
+logs_v5/
 out/
 output/
 training.log

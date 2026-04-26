@@ -54,12 +54,6 @@ def main():
         help='Maximum number of validation samples to use',
     )
     parser.add_argument(
-        '--paraphrase_cache',
-        type=str,
-        default='./paraphrase_cache_train.json',
-        help='パラフレーズキャッシュJSONファイルのパス',
-    )
-    parser.add_argument(
         '--dpo',
         action='store_true',
         help='SFT完了後にDPOフェーズを実行する',
@@ -70,7 +64,8 @@ def main():
     if args.resume_from_checkpoint and args.resume_from_checkpoint.lower() == 'true':
         args.resume_from_checkpoint = True
 
-    os.environ['TENSORBOARD_LOGGING_DIR'] = './logs_v3'
+    os.environ['TENSORBOARD_LOGGING_DIR'] = './logs_v5'
+    os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
 
     local_rank = int(os.environ.get('LOCAL_RANK', 0))
     torch.cuda.set_device(local_rank)
@@ -86,7 +81,7 @@ def main():
         bnb_4bit_compute_dtype=torch.bfloat16,
     )
 
-    processor = AutoProcessor.from_pretrained(model_id, padding_side='left')
+    processor = AutoProcessor.from_pretrained(model_id, padding_side='left', max_pixels=448 * 448)
 
     # HierTextデータセット（annotationのみロード、VRAMゼロ）
     print('Loading HierText train dataset...')
@@ -94,16 +89,11 @@ def main():
         annotation_file='/home/user/dev/dev_hiertext/hiertext/gt/train.jsonl.gz',
         processor=processor,
         max_samples=args.max_train_samples,
+        max_samples_per_image=3,
         mask_dir='/home/user/dev/dev_hiertext/hiertext/Mask_Monochro_train',
         masked_image_dir='/home/user/dev/dev_hiertext/hiertext/Masked_Images_train',
         augment=True,
     )
-
-    # パラフレーズキャッシュのロード（generate_paraphrases.py で事前生成したファイルを読み込む）
-    if os.path.exists(args.paraphrase_cache):
-        train_dataset.load_paraphrase_cache(args.paraphrase_cache)
-    else:
-        print(f'Paraphrase cache not found at {args.paraphrase_cache}, skipping.')
 
     model = AutoModelForImageTextToText.from_pretrained(
         model_id,
@@ -119,7 +109,7 @@ def main():
     checkpoint_path = None
     if args.resume_from_checkpoint:
         if isinstance(args.resume_from_checkpoint, bool) or args.resume_from_checkpoint.lower() == 'true':
-            checkpoint_path = trainer_utils.get_last_checkpoint('./qwen_model_checkpoints_hiertext_v3')
+            checkpoint_path = trainer_utils.get_last_checkpoint('./qwen_model_checkpoints_hiertext_v5')
         else:
             checkpoint_path = args.resume_from_checkpoint
 
@@ -138,10 +128,10 @@ def main():
         print('Initializing new LoRA adapter')
         lora_config = LoraConfig(
             task_type=TaskType.CAUSAL_LM,
-            r=4,
-            lora_alpha=16,
+            r=16,
+            lora_alpha=32,
             lora_dropout=0.05,
-            target_modules=['q_proj', 'v_proj'],
+            target_modules=['q_proj', 'k_proj', 'v_proj', 'o_proj'],
             bias='none',
         )
         model = get_peft_model(model, lora_config, adapter_name='lora_sft')
@@ -164,7 +154,7 @@ def main():
 
     # TrainingArguments設定
     training_args = TrainingArguments(
-        output_dir='./qwen_model_checkpoints_hiertext_v3',
+        output_dir='./qwen_model_checkpoints_hiertext_v5',
         per_device_train_batch_size=4,
         num_train_epochs=6,
         learning_rate=2e-5,
@@ -192,12 +182,7 @@ def main():
         eval_dataset=val_dataset,
         data_collator=collator,
         processing_class=processor,
-        length_penalty_weight=0.1,
-        surrounding_context_loss_weight=0.05,
-        embedding_model_id='Qwen/Qwen3-VL-Embedding-2B',
         compute_metrics_freq=100,
-        inference_log_freq=100,
-        num_viz_samples=3,
     )
 
     # 学習実行
@@ -217,6 +202,11 @@ def main():
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
+    print('\nSaving model to ./qwen_model_hiertext_v5')
+    model.save_pretrained('./qwen_model_hiertext_v5')
+    processor.save_pretrained('./qwen_model_hiertext_v5')
+    print('Model saved successfully!')
+
     # =====================
     # DPOフェーズ（SFT完了後）
     # =====================
@@ -226,7 +216,7 @@ def main():
 
     print('\nStarting DPO fine-tuning phase...')
     dpo_args = TrainingArguments(
-        output_dir='./qwen_model_checkpoints_hiertext_v3_dpo',
+        output_dir='./qwen_model_checkpoints_hiertext_v5_dpo',
         per_device_train_batch_size=4,
         num_train_epochs=1,
         learning_rate=5e-6,
@@ -241,7 +231,7 @@ def main():
         dataloader_num_workers=0,
         remove_unused_columns=False,
         report_to=['tensorboard'],
-        logging_dir='./logs_v3_dpo',
+        logging_dir='./logs_v5_dpo',
         optim='paged_adamw_8bit',
         ddp_find_unused_parameters=False,
     )
@@ -268,9 +258,9 @@ def main():
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-    print('\nSaving model and tokenizer to ./qwen_model_hiertext_v3')
-    model.save_pretrained('./qwen_model_hiertext_v3')
-    processor.save_pretrained('./qwen_model_hiertext_v3')
+    print('\nSaving model and tokenizer to ./qwen_model_hiertext_v5_dpo')
+    model.save_pretrained('./qwen_model_hiertext_v5_dpo')
+    processor.save_pretrained('./qwen_model_hiertext_v5_dpo')
     print('Model saved successfully!')
     print('HierText training completed.')
 
